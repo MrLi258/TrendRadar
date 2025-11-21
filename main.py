@@ -4,6 +4,7 @@ import json
 import os
 import random
 import re
+import sys
 import time
 import webbrowser
 import smtplib
@@ -14,11 +15,12 @@ from email.utils import formataddr, formatdate, make_msgid
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
-
+import importlib.util
+import sys
 import pytz
 import requests
 import yaml
-
+from anyio import fail_after
 
 VERSION = "3.0.5"
 
@@ -128,12 +130,15 @@ def load_config():
             "FREQUENCY_WEIGHT": config_data["weight"]["frequency_weight"],
             "HOTNESS_WEIGHT": config_data["weight"]["hotness_weight"],
         },
-        "PLATFORMS": config_data["platforms"],
+        "API_PLATFORMS": config_data["api_platforms"] if config_data["api_platforms"] else [],
+        "CUSTOMIZED_PLATFORMS": config_data["customized_platforms"] if config_data["customized_platforms"] else [],
     }
 
     # 通知渠道配置（环境变量优先）
     notification = config_data.get("notification", {})
     webhooks = notification.get("webhooks", {})
+
+
 
     config["FEISHU_WEBHOOK_URL"] = os.environ.get(
         "FEISHU_WEBHOOK_URL", ""
@@ -215,7 +220,7 @@ def load_config():
 print("正在加载配置...")
 CONFIG = load_config()
 print(f"TrendRadar v{VERSION} 配置加载完成")
-print(f"监控平台数量: {len(CONFIG['PLATFORMS'])}")
+print(f"监控平台数量: {(len_api_paltforms:=len(CONFIG['API_PLATFORMS']) if CONFIG['API_PLATFORMS'] else 0) + (len_api_paltforms:=len(CONFIG['CUSTOMIZED_PLATFORMS']) if CONFIG['CUSTOMIZED_PLATFORMS'] else 0)}")
 
 
 # === 工具函数 ===
@@ -326,6 +331,20 @@ def html_escape(text: str) -> str:
         .replace("'", "&#x27;")
     )
 
+def load_module_from_file(module_name, file_path):
+    # 1. 获取模块说明对象 spec
+    spec = importlib.util.spec_from_file_location(module_name, file_path)
+
+    # 2. 创建模块对象
+    module = importlib.util.module_from_spec(spec)
+
+    # 3. 将模块加入 sys.modules（可选，但通常推荐）
+    sys.modules[module_name] = module
+
+    # 4. 执行模块代码
+    spec.loader.exec_module(module)
+
+    return module
 
 # === 推送记录管理 ===
 class PushRecordManager:
@@ -431,8 +450,8 @@ class PushRecordManager:
 
 
 # === 数据获取 ===
-class DataFetcher:
-    """数据获取器"""
+class DataFetcher:  # api的方式是实现数据获取
+    """api网站数据获取器"""
 
     def __init__(self, proxy_url: Optional[str] = None):
         self.proxy_url = proxy_url
@@ -551,6 +570,61 @@ class DataFetcher:
         print(f"成功: {list(results.keys())}, 失败: {failed_ids}")
         return results, id_to_name, failed_ids
 
+class CustomizedDataFetcher:
+    """自定义网站数据获取器"""
+    def __init__(self, proxy_url: Optional[str] = None):
+        self.proxy_url = proxy_url
+
+    def fetch_data(
+            self,
+            id_info: Union[str, Tuple[str, str]],
+    ) -> Tuple[Optional[str], str, str]:
+        """获取指定ID数据，支持重试"""
+        if isinstance(id_info, tuple):
+            id_value, alias = id_info
+        else:
+            id_value = id_info
+            alias = id_value
+
+        proxies = None
+        if self.proxy_url:
+            proxies = {"http": self.proxy_url, "https": self.proxy_url}
+        crawler = load_module_from_file(id_value, f'./customized_website_crawler/{id_value}.py')
+        result = crawler.run()
+        return result, id_value, alias
+
+    def crawl_websites(
+            self,
+            ids_list: List[Union[str, Tuple[str, str]]],
+            request_interval: int = CONFIG["REQUEST_INTERVAL"],
+    ) -> Tuple[Dict, Dict, List]:
+        """爬取多个网站数据"""
+        results = {}
+        id_to_name = {}
+        failed_ids = []
+
+        for i, id_info in enumerate(ids_list):
+            if isinstance(id_info, tuple):
+                id_value, name = id_info
+            else:
+                id_value = id_info
+                name = id_value
+
+            id_to_name[id_value] = name
+            result, id_value, alias = self.fetch_data(id_info)
+
+            if result:
+                results[id_value] = result
+            else:
+                failed_ids.append(id_value)
+
+            if i < len(ids_list) - 1:
+                actual_interval = request_interval + random.randint(-10, 20)
+                actual_interval = max(50, actual_interval)
+                time.sleep(actual_interval / 1000)
+
+        print(f"成功: {list(results.keys())}, 失败: {failed_ids}")
+        return results, id_to_name, failed_ids
 
 # === 数据处理 ===
 def save_titles_to_file(results: Dict, id_to_name: Dict, failed_ids: List) -> str:
@@ -627,9 +701,9 @@ def load_frequency_words(
     for group in word_groups:
         words = [word.strip() for word in group.split("\n") if word.strip()]
 
-        group_required_words = []
-        group_normal_words = []
-        group_filter_words = []
+        group_required_words = []  # +开头的关键词
+        group_normal_words = []  # 除了！或+的关键词
+        group_filter_words = []  # !开头的关键词
 
         for word in words:
             if word.startswith("!"):
@@ -853,7 +927,7 @@ def detect_latest_new_titles(current_platform_ids: Optional[List[str]] = None) -
         return {}
 
     files = sorted([f for f in txt_dir.iterdir() if f.suffix == ".txt"])
-    if len(files) < 2:
+    if len(files) < 2:  # 因为只有一个文件的话就不存在历史记录这一说法了，当前的就是最新的
         return {}
 
     # 解析最新文件
@@ -873,7 +947,7 @@ def detect_latest_new_titles(current_platform_ids: Optional[List[str]] = None) -
     for file_path in files[:-1]:
         historical_data, _ = parse_file_titles(file_path)
 
-        # 过滤历史数据
+        # 过滤历史数据  --找出当日内之前对相同平台爬取过的新闻数据
         if current_platform_ids is not None:
             filtered_historical_data = {}
             for source_id, title_data in historical_data.items():
@@ -4051,7 +4125,8 @@ class NewsAnalyzer:
         self.update_info = None
         self.proxy_url = None
         self._setup_proxy()
-        self.data_fetcher = DataFetcher(self.proxy_url)
+        self.api_data_fetcher = DataFetcher(self.proxy_url)
+        self.customized_data_fetcher = CustomizedDataFetcher(self.proxy_url)
 
         if self.is_github_actions:
             self._check_version_update()
@@ -4144,7 +4219,7 @@ class NewsAnalyzer:
         try:
             # 获取当前配置的监控平台ID列表
             current_platform_ids = []
-            for platform in CONFIG["PLATFORMS"]:
+            for platform in CONFIG["API_PLATFORMS"] + CONFIG["CUSTOMIZED_PLATFORMS"]:
                 current_platform_ids.append(platform["id"])
 
             print(f"当前监控平台: {current_platform_ids}")
@@ -4381,22 +4456,44 @@ class NewsAnalyzer:
 
     def _crawl_data(self) -> Tuple[Dict, Dict, List]:
         """执行数据爬取"""
-        ids = []
-        for platform in CONFIG["PLATFORMS"]:
-            if "name" in platform:
-                ids.append((platform["id"], platform["name"]))
-            else:
-                ids.append(platform["id"])
-
-        print(
-            f"配置的监控平台: {[p.get('name', p['id']) for p in CONFIG['PLATFORMS']]}"
-        )
+        api_ids = []
+        if CONFIG["API_PLATFORMS"]:
+            for platform in CONFIG["API_PLATFORMS"]:
+                if "name" in platform:
+                    api_ids.append((platform["id"], platform["name"]))
+                else:
+                    api_ids.append(platform["id"])
+            print(
+                f"api配置的监控平台: {[p.get('name', p['id']) for p in CONFIG['API_PLATFORMS']]}"
+            )
+        customized_ids = []
+        if CONFIG["CUSTOMIZED_PLATFORMS"]:
+            for platform in CONFIG["CUSTOMIZED_PLATFORMS"]:
+                if "name" in platform:
+                    customized_ids.append((platform["id"], platform["name"]))
+                else:
+                    customized_ids.append(platform["id"])
+            print(
+                f"customized配置的监控平台:{[p.get('name', p['id']) for p in CONFIG['CUSTOMIZED_PLATFORMS']]}"
+            )
         print(f"开始爬取数据，请求间隔 {self.request_interval} 毫秒")
         ensure_directory_exists("output")
 
-        results, id_to_name, failed_ids = self.data_fetcher.crawl_websites(
-            ids, self.request_interval
+        api_results, api_id_to_name, api_failed_ids = self.api_data_fetcher.crawl_websites(
+            api_ids, self.request_interval
         )
+        customized_results, customized_id_to_name, customized_failed_ids = self.customized_data_fetcher.crawl_websites(
+            customized_ids, self.request_interval
+        )
+        results = {}
+        results.update(api_results)
+        results.update(customized_results)
+        id_to_name = {}
+        id_to_name.update(customized_id_to_name)
+        id_to_name.update(customized_id_to_name)
+        failed_ids = []
+        failed_ids.extend(api_failed_ids)
+        failed_ids.extend(customized_failed_ids)
 
         title_file = save_titles_to_file(results, id_to_name, failed_ids)
         print(f"标题已保存到: {title_file}")
@@ -4408,7 +4505,7 @@ class NewsAnalyzer:
     ) -> Optional[str]:
         """执行模式特定逻辑"""
         # 获取当前监控平台ID列表
-        current_platform_ids = [platform["id"] for platform in CONFIG["PLATFORMS"]]
+        current_platform_ids = [platform["id"] for platform in CONFIG["API_PLATFORMS"] + CONFIG["CUSTOMIZED_PLATFORMS"]]
 
         new_titles = detect_latest_new_titles(current_platform_ids)
         time_info = Path(save_titles_to_file(results, id_to_name, failed_ids)).stem
